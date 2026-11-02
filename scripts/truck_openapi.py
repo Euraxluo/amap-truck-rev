@@ -15,13 +15,13 @@
   height,width,load,weight,axis → v_height/v_width/v_load/v_weight/v_axis
   province+number    → carplate (省份汉字+号码拼接, 政策限行判定)
   cartype(0/1/2)     → v_type (0普通/1纯电/2混动)
-  nosteps,showpolyline → 透传控制响应裁剪
-  key                → 忽略 (兼容官方调用方式)
+  nosteps           → 1 时不返回 steps (性能优化)
+  key               → 忽略 (兼容官方调用方式, 本通道无需 key)
 
-返回: 官方 v4 schema {errcode:0, errmsg:"OK", data:{count, route:{origin,
-destination, paths:[{distance,duration,strategy,tolls,toll_distance,
-restriction,steps:[{instruction,orientation,road,distance,duration,
-polyline,action,assistant_action,tmcs}]}]}}}
+返回: 只含通道真实字段 {errcode:0, errmsg:"OK", data:{count, route:{origin,
+destination, paths:[{distance,duration,tolls,steps:[{instruction,road,
+distance,cameras:[{x,y,type,speed}]}]}]}}}
+(不返回 polyline/tmcs/restriction/action 等通道不存在的字段)
 坐标系: GCJ-02 (与官方一致)
 """
 import hashlib, json, logging
@@ -90,7 +90,7 @@ def call_app_route(origin, dest, waypoints=None, size='2', height=None, width=No
     return json.load(urllib.request.urlopen(req, timeout=25))
 
 
-def to_v4(raw, origin, dest, nosteps=False, showpolyline=True):
+def to_v4(raw, origin, dest, nosteps=False):
     """APP 私有响应 → 官方 v4 schema"""
     if str(raw.get('code')) != '1':
         return {'errcode': int(raw.get('code') or 0) or -1,
@@ -108,27 +108,17 @@ def to_v4(raw, origin, dest, nosteps=False, showpolyline=True):
                 continue
             steps.append({
                 'instruction': s.get('text', ''),
-                'orientation': s.get('orientation', ''),
                 'road': s.get('name', ''),
                 'distance': int(s.get('length', 0) or 0),
-                # APP 不分段返回耗时, 按距离均摊总耗时
-                'duration': int(durs[i] * int(s.get('length', 0) or 0) / dists[i]) if i < len(durs) and i < len(dists) and dists[i] else 0,
-                'polyline': s.get('polyline', '') if showpolyline else '',
-                'action': s.get('action', ''),
-                'assistant_action': s.get('assistant_action', ''),
-                'tmcs': [{'distance': t.get('length', 0), 'status': t.get('status', 0),
-                          'polyline': t.get('polyline', '') if showpolyline else ''}
-                         for t in (s.get('tmcs') or []) if isinstance(t, dict)],
+                'cameras': [{'x': c.get('x'), 'y': c.get('y'), 'type': c.get('type'), 'speed': c.get('speed')}
+                            for c in (s.get('cameras') or []) if isinstance(c, dict)],
             })
         if nosteps:
             steps = []
         paths.append({
             'distance': int(dists[i]) if i < len(dists) else 0,
             'duration': int(durs[i]) if i < len(durs) else 0,
-            'strategy': raw.get('strategy', '0'),
             'tolls': costs[i] if i < len(costs) and costs[i] else 0,
-            'toll_distance': 0,
-            'restriction': 0,
             'steps': steps,
         })
     return {
@@ -182,8 +172,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({'errcode': 10002, 'errmsg': 'UPSTREAM_ERROR', 'errdetail': str(e)})
             return
         out = to_v4(raw, origin, dest,
-                    nosteps=q.get('nosteps', ['0'])[0] == '1',
-                    showpolyline=q.get('showpolyline', ['1'])[0] == '1')
+                    nosteps=q.get('nosteps', ['0'])[0] == '1')
         self._json(out)
 
     def _json(self, obj, code=200):
