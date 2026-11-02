@@ -48,11 +48,18 @@ def amap_route(fx, fy, tx, ty, truck=None, plate='京A12345', policy='32', via=N
 
 
 def summarize(raw):
+    def floats(v):
+        return [float(x) for x in str(v).split(',')] if v else []
+    dists = floats(raw.get('distance'))
+    durs = [int(x) for x in str(raw.get('drivetime', '') or '').split(',') if x]
+    costs = floats(raw.get('cost'))
     out = {
         'code': raw.get('code'),
-        'distance_m': float(raw.get('distance', 0) or 0),
-        'duration_s': int(raw.get('drivetime', 0) or 0),
-        'toll_yuan': float(raw.get('cost', 0) or 0) if raw.get('cost') else None,
+        'distance_m': dists[0] if dists else None,
+        'all_distances_m': dists,
+        'duration_s': durs[0] if durs else None,
+        'all_durations_s': durs,
+        'toll_yuan': costs[0] if costs else None,
     }
     paths = []
     for pl in raw.get('path_list', []):
