@@ -79,3 +79,44 @@ sign = Sign.getSign( concat(sign数组各字段值) )
 - work/raw/lib/arm64-v8a/  native 库 (73 个)
 - work/disasm_cloud_route_router.txt  fcn.00c798ec 全反汇编
 - work/disasm_truck_param_builder.txt fcn.00c7afb0 全反汇编
+
+
+## 最终结果 (2026-11-02 全链路打通 ✅)
+
+### 签名三要素 (libserverkey.so 静态还原 + curl 实测)
+
+```
+AosChannel = "amap7a"        (0x3650 getAosChannel, 签名校验和==0x3576 分支)
+AosKey     = "xnaEwInMxaMQ2m0cw6Y1bDm7ns0YVxYS9v7JlC8I"  (0x3bb0 getAosKey, 同分支)
+             非官方 APK 签名时两者均返回 "unknown" (校验和 = 证书字节和, 0x3576=官方值)
+sign 算法  = 纯 Java MessageDigest("MD5") (0x6f50 sign: getInstance→digest→hex)
+             输入 = AosChannel + fromX + fromY + toX + toY + "@" + AosKey
+channel 参数 = "amap7a" 必填 (数字渠道号 90026 反而走不通网关)
+```
+
+### 实测验证
+
+- `POST m5.amap.com/ws/mapapi/navigation/auto/` + sign + channel=amap7a → **code:1 Successful**
+- 北京市内货车: 14.4km / 2060s / 过路费39元 / 42步 turn-by-turn
+- 北京→上海 (货车 13m 长 31t): **1221.7km / 59760s / path_list 完整**
+- viapoints / policy2 / 车辆全参数 (v_height/width/length/load/weight/axis/size/carplate) 均接受
+- 无需 xxTea body 加密 (output=json 明文通道), 无需 x-sign SecurityGuard 头
+
+### 封装
+
+`scripts/truck_proxy.py` — 本地 HTTP 代理:
+```
+GET /route?from=lon,lat&to=lon,lat[&via=..&plate=..&policy=..&height=..&raw=1]
+→ {code, distance_m, duration_s, toll_yuan, steps:[{name,text,length_m,cameras}]}
+```
+监听 127.0.0.1:18964, 冒烟通过。坐标 GCJ-02。
+
+### 完整签名还原路径 (纯静态, 未用模拟器)
+
+1. jadx: Sign.java → serverkey.sign(channel+payload+"@"+aosKey) → ServerkeyNative (JNI)
+2. r2: libserverkey.so JNI_OnLoad 解 33 方法注册表 (栈拼名 + adr 函数指针)
+3. sign@0x6f50: NewStringUTF("MD5")+MessageDigest → 标准 MD5 → hex 表@0xdf0
+4. getAosKey@0x3bb0 / getAosChannel@0x3650: 包签名校验和(SIMD saddw 求和)==0x3576 →
+   返回 rodata 交错拼装的 41 字节 key / 6 字节 channel; 否则 "unknown"
+5. 官方 APK 即满足校验和; 重打包破坏校验和 → 网关拒签
+6. 动态环境 (emulator+frida-server+hook 脚本) 已备好未用上, 留作风控升级时的对照验证手段
