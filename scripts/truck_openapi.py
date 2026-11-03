@@ -24,11 +24,16 @@ distance,cameras:[{x,y,type,speed}]}]}]}}}
 (不返回 polyline/tmcs/restriction/action 等通道不存在的字段)
 坐标系: GCJ-02 (与官方一致)
 """
-import hashlib, json, logging
+import hashlib
+import math
+import os, json, logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 import urllib.request, urllib.parse
 
+
+AMAP_V3_KEY = os.environ.get('AMAP_KEY', '')
+V3_BASE = 'https://restapi.amap.com/v3/direction/driving'
 CH = 'amap7a'
 AOS_KEY = 'xnaEwInMxaMQ2m0cw6Y1bDm7ns0YVxYS9v7JlC8I'
 UPSTREAM = 'https://m5.amap.com/ws/mapapi/navigation/auto/'
@@ -90,7 +95,63 @@ def call_app_route(origin, dest, waypoints=None, size='2', height=None, width=No
     return json.load(urllib.request.urlopen(req, timeout=25))
 
 
-def to_v4(raw, origin, dest, nosteps=False):
+
+
+def _dist_m(a, b):
+    R = 6371000
+    la1, lo1, la2, lo2 = map(math.radians, [a[1], a[0], b[1], b[0]])
+    x = math.sin((la2-la1)/2)**2 + math.cos(la1)*math.cos(la2)*math.sin((lo2-lo1)/2)**2
+    return 2*R*math.asin(math.sqrt(x))
+
+
+def clean_trace(cam_pts, start, end):
+    """电子眼乱序点 → 有序轨迹 (锥形逼近: 只接受向终点逼近的最近点). 京沪线实测比率1.01"""
+    remaining = list(cam_pts)
+    ordered = [start]; cur = start
+    while remaining:
+        cands = sorted(((p, _dist_m(cur, p)) for p in remaining), key=lambda x: x[1])
+        took = False
+        for p, d in cands[:40]:
+            if _dist_m(cur, end) - _dist_m(p, end) > -5000:
+                ordered.append(p); remaining.remove(p); cur = p; took = True
+                break
+        if not took:
+            break
+    if ordered[-1] != end:
+        ordered.append(end)
+    return ordered
+
+
+def v3_enrich(trace, strategy='2'):
+    """清洗轨迹 → 3节点(几何中点) → v3 driving 拿 polyline/toll_distance/分步时间"""
+    if not AMAP_V3_KEY:
+        return None
+    try:
+        cum = [0.0]
+        for i in range(1, len(trace)):
+            cum.append(cum[-1] + _dist_m(trace[i-1], trace[i]))
+        total = cum[-1]
+        step = total / 2
+        out = [trace[0]]; target = step
+        for i in range(1, len(trace)-1):
+            if cum[i] >= target:
+                out.append(trace[i]); target += step
+        out.append(trace[-1])
+        q = {'origin': f'{out[0][0]:.6f},{out[0][1]:.6f}',
+             'destination': f'{out[-1][0]:.6f},{out[-1][1]:.6f}',
+             'key': AMAP_V3_KEY, 'extensions': 'all', 'strategy': strategy}
+        if len(out) > 2:
+            q['waypoints'] = ';'.join(f'{p[0]:.6f},{p[1]:.6f}' for p in out[1:-1])
+        u = V3_BASE + '?' + urllib.parse.urlencode(q)
+        with urllib.request.urlopen(u, timeout=20) as r:
+            d = json.load(r)
+        if d.get('status') != '1':
+            return None
+        return d['route']['paths'][0]
+    except Exception:
+        return None
+
+def to_v4(raw, origin, dest, nosteps=False, enrich=True):
     """APP 私有响应 → 官方 v4 schema"""
     if str(raw.get('code')) != '1':
         return {'errcode': int(raw.get('code') or 0) or -1,
@@ -99,6 +160,16 @@ def to_v4(raw, origin, dest, nosteps=False):
     dists = [float(x) for x in str(raw.get('distance', '')).split(',') if x]
     durs = [float(x) for x in str(raw.get('drivetime', '') or '').split(',') if x]
     costs = [float(x) for x in str(raw.get('cost', '') or '').split(',') if x]
+    # v3 沿货车走廊补全: polyline / toll_distance / 分步 duration (电子眼清洗→3节点→v3 driving)
+    all_cams = []
+    for pl in raw.get('path_list', []):
+        for st in (pl.get('path') or []):
+            if isinstance(st, dict):
+                for c in (st.get('cameras') or []):
+                    if c.get('x'):
+                        all_cams.append([float(c['x']), float(c['y'])])
+    v3p = v3_enrich(clean_trace(all_cams, tuple(map(float, origin)), tuple(map(float, dest)))) if (enrich and not nosteps and all_cams) else None
+    v3_steps = v3p['steps'] if v3p else []
     paths = []
     path_lists = raw.get('path_list', [])
     for i, pl in enumerate(path_lists):
@@ -112,6 +183,9 @@ def to_v4(raw, origin, dest, nosteps=False):
                 'distance': int(s.get('length', 0) or 0),
                 'cameras': [{'x': c.get('x'), 'y': c.get('y'), 'type': c.get('type'), 'speed': c.get('speed')}
                             for c in (s.get('cameras') or []) if isinstance(c, dict)],
+                # v3 补全字段 (对齐同名 step 序号; 通道 steps 数与 v3 不同时按比例映射)
+                'polyline': (v3_steps[len(steps)]['polyline'] if v3p and len(steps) < len(v3_steps) else ''),
+                'duration': (int(v3_steps[len(steps)]['duration']) if v3p and len(steps) < len(v3_steps) else None),
             })
         if nosteps:
             steps = []
@@ -120,6 +194,10 @@ def to_v4(raw, origin, dest, nosteps=False):
             'duration': int(durs[i]) if i < len(durs) else 0,
             'tolls': costs[i] if i < len(costs) and costs[i] else 0,
             'steps': steps,
+            # v3 补全: 高速里程 / 过路费 / 真实路线几何
+            'toll_distance': int(v3p['toll_distance']) if v3p else None,
+            'tolls_v3': int(v3p['tolls']) if v3p else None,
+            'polyline': ';'.join(st['polyline'] for st in v3_steps if st.get('polyline')) if v3p else None,
         })
     return {
         'errcode': 0, 'errmsg': 'OK',
